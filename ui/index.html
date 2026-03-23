@@ -175,7 +175,14 @@ function toggleConv(){
 
 async function fetchHealth(){
   try{var h=await(await fetch('/health')).json();
-  document.getElementById('sb').innerHTML='<span style="color:'+(h.status==='ok'?'var(--green)':'var(--red)')+'">●</span> '+h.model+' | Jobs:'+h.activeJobs+' Queue:'+h.queueDepth+' | '+((h.agents||[]).length)+' agents';
+  // Count pending tasks from task list
+  var stats={};try{stats=await(await fetch('/api/tasks/stats')).json();}catch{}
+  document.getElementById('sb').innerHTML='<span style="color:'+(h.status==='ok'?'var(--green)':'var(--red)')+'">●</span> '+h.model
+    +' | Jobs:'+h.activeJobs
+    +(stats.pending?' | <span style="color:var(--amber)">'+stats.pending+' pending</span>':'')
+    +(stats.in_progress?' | <span style="color:var(--blue)">'+stats.in_progress+' running</span>':'')
+    +' | '+((h.agents||[]).length)+' agents'
+    +' <button onclick="cleanup()" style="font-size:8px;padding:1px 5px;background:var(--red);color:var(--bg);border:none;border-radius:2px;cursor:pointer;margin-left:4px;">Cleanup</button>';
   }catch{document.getElementById('sb').innerHTML='<span style="color:var(--red)">● Offline</span>';}
 }
 
@@ -196,7 +203,7 @@ async function fetchTasks(){
       body='<div style="margin-top:6px;">'+msgs.map(m=>{
         if(m.role==='system')return'<div class="msg system">'+esc(m.content)+'</div>';
         if(m.role==='error')return'<div class="msg error"><div class="msg-hdr" style="color:var(--red)">Error</div><div class="msg-body">'+esc(m.content)+'</div></div>';
-        if(m.role==='user'){var att=m.attachment?'<div style="margin-top:4px;"><a href="/api/files/'+encodeURIComponent(m.attachment)+'" target="_blank" style="font-size:10px;color:var(--blue);text-decoration:none;padding:3px 6px;background:var(--surface2);border-radius:3px;">📎 '+esc(m.attachment)+'</a></div>':'';return'<div class="msg user"><div class="msg-hdr" style="color:var(--cyan)">You — '+(m.ts?new Date(m.ts).toLocaleTimeString():'')+'</div><div class="msg-body">'+esc(m.content)+'</div>'+att+'</div>';}
+        if(m.role==='user'){var att=m.attachment?'<div style="margin-top:4px;"><a href="/api/files/'+encodeURIComponent(m.attachment)+'" target="_blank" style="font-size:10px;color:var(--blue);text-decoration:none;padding:3px 6px;background:var(--surface2);border-radius:3px;">📎 '+esc(m.attachment)+'</a></div>':'';var src=t.source&&t.source!=='user'?t.source:'You';var srcColor=src==='You'?'var(--cyan)':'var(--purple)';return'<div class="msg user"><div class="msg-hdr" style="color:'+srcColor+'">'+src+' — '+(m.ts?new Date(m.ts).toLocaleTimeString():'')+'</div><div class="msg-body">'+esc(m.content)+'</div>'+att+'</div>';}
         var ac=AC[m.agent]||'var(--amber)';
         var isStreaming=m.streaming||(m.content||'').endsWith('▌');
         var filesHtml='';
@@ -253,7 +260,7 @@ function sendMsg(tid){
   i.value='';expanded.add(tid);
   fetch('/api/tasks/'+tid+'/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,rounds:rounds})}).catch(()=>{});
   fetchTasks();
-  var poll=setInterval(()=>{fetchTasks();},4000);
+  var poll=setInterval(()=>{if(!isUserTyping())fetchTasks();},4000);
   setTimeout(()=>clearInterval(poll),300000);
 }
 
@@ -284,7 +291,7 @@ async function createTask(){
   fetch('/api/tasks/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).catch(()=>{});
   fetchTasks();
   // Fast poll during active task (every 2s)
-  var poll=setInterval(()=>{fetchTasks();},2000);
+  var poll=setInterval(()=>{if(!isUserTyping())fetchTasks();},2000);
   setTimeout(()=>clearInterval(poll),300000);
 }
 
@@ -384,29 +391,24 @@ async function fetchReports(){
 }
 
 // Old fetchMetrics removed — replaced by background collector + renderMetrics above
-// Metrics: always collect data, only draw when visible
+// Load persisted metrics history from server, then poll for updates
+(async()=>{
+  try{
+    var h=await(await fetch('/api/metrics-history')).json();
+    if(h.timestamps&&h.timestamps.length){metricsHistory=h;metricsHistory._latest=null;}
+  }catch{}
+  try{metricsHistory._latest=await(await fetch('/api/metrics')).json();}catch{}
+  if(document.getElementById('p-metrics').classList.contains('active'))renderMetrics();
+})();
+// Poll — server persists history so just fetch latest for cards + update local copy
 setInterval(async()=>{
   try{
-    var m=await(await fetch('/api/metrics')).json();
-    metricsHistory.timestamps.push(Date.now());
-    metricsHistory.sandbox_ram.push(parseFloat(m.sandbox?.ramUsedGB||0));
-    if(m.gpu-server?.gpus?.[0]){
-      metricsHistory.gpu0_vram.push(parseInt(m.gpu-server.gpus[0].memUsed)||0);
-      metricsHistory.gpu0_temp.push(parseInt(m.gpu-server.gpus[0].temp)||0);
-    }
-    if(m.gpu-server?.gpus?.[1])metricsHistory.gpu1_vram.push(parseInt(m.gpu-server.gpus[1].memUsed)||0);
-    while(metricsHistory.timestamps.length>MAX_POINTS){
-      metricsHistory.timestamps.shift();metricsHistory.sandbox_ram.shift();
-      metricsHistory.gpu0_vram.shift();metricsHistory.gpu0_temp.shift();metricsHistory.gpu1_vram.shift();
-    }
-    // Store latest for cards
-    metricsHistory._latest=m;
-    // Render if visible
+    var h=await(await fetch('/api/metrics-history')).json();
+    if(h.timestamps)metricsHistory=Object.assign(metricsHistory,h);
+    metricsHistory._latest=await(await fetch('/api/metrics')).json();
     if(document.getElementById('p-metrics').classList.contains('active'))renderMetrics();
   }catch{}
 },5000);
-// First fetch immediately
-(async()=>{try{metricsHistory._latest=await(await fetch('/api/metrics')).json();}catch{}})();
 
 function renderMetrics(){
   var m=metricsHistory._latest;
@@ -414,22 +416,22 @@ function renderMetrics(){
   var el=document.getElementById('metrics-cards');
   var html='<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;">'
     +'<div style="font-size:9px;color:var(--cyan);text-transform:uppercase;margin-bottom:4px;">Sandbox VM</div>'
-    +'<div style="font-size:14px;font-weight:700;color:var(--cyan);">'+(m.sandbox?.ramUsedGB||'?')+' / '+(m.sandbox?.ramTotalGB||'?')+' GB RAM</div></div>';
+    +'<div style="font-size:14px;font-weight:700;color:var(--cyan);">'+(m.sandbox_vm?.ramUsedGB||'?')+' / '+(m.sandbox_vm?.ramTotalGB||'?')+' GB RAM</div></div>';
   html+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;">'
-    +'<div style="font-size:9px;color:var(--amber);text-transform:uppercase;margin-bottom:4px;">GPU Server</div>';
-  if(m.gpu-server?.gpus){
-    m.gpu-server.gpus.forEach((g,i)=>{
+    +'<div style="font-size:9px;color:var(--amber);text-transform:uppercase;margin-bottom:4px;">Barracuda</div>';
+  if(m.gpu_server?.gpus){
+    m.gpu_server.gpus.forEach((g,i)=>{
       var pct=Math.round(parseInt(g.memUsed)/parseInt(g.memTotal)*100);
       html+='<div style="font-size:11px;margin-bottom:3px;"><span style="color:var(--amber);font-weight:600;">GPU'+i+'</span> '+esc(g.memUsed)+'/'+esc(g.memTotal)+' ('+pct+'%) | '+esc(g.util)+' | '+esc(g.temp)+'°C | '+esc(g.power||'')+'</div>';
     });
   }
-  html+='<div style="font-size:10px;color:var(--muted);margin-top:4px;">RAM: '+(m.gpu-server?.ramUsedGB||'?')+' / '+(m.gpu-server?.ramTotalGB||'?')+' GB</div></div>';
+  html+='<div style="font-size:10px;color:var(--muted);margin-top:4px;">RAM: '+(m.gpu_server?.ramUsedGB||'?')+' / '+(m.gpu_server?.ramTotalGB||'?')+' GB</div></div>';
   el.innerHTML=html;
 
   drawChart('chart-gpu0',metricsHistory.gpu0_vram,24576,'rgb(232,168,56)','RTX 3090 VRAM (MiB)');
   drawChart('chart-gpu1',metricsHistory.gpu1_vram,10240,'rgb(192,132,252)','RTX 3080 VRAM (MiB)');
   drawChart('chart-temp',metricsHistory.gpu0_temp,90,'rgb(232,85,85)','GPU Temp (°C)');
-  drawChart('chart-ram',metricsHistory.sandbox_ram,parseFloat(m.sandbox?.ramTotalGB||12),'rgb(78,205,196)','Sandbox VM RAM (GB)');
+  drawChart('chart-ram',metricsHistory.sandbox_vm_ram,parseFloat(m.sandbox_vm?.ramTotalGB||12),'rgb(78,205,196)','Sandbox VM RAM (GB)');
 }
 
 async function fetchLogs(){try{var d=await(await fetch('/api/logs')).json();var el=document.getElementById('log-c');el.textContent=d.content||'No logs.';el.scrollTop=el.scrollHeight;}catch{}}
@@ -437,17 +439,24 @@ async function fetchLogs(){try{var d=await(await fetch('/api/logs')).json();var 
 function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
 // Metrics history for charts
-var metricsHistory={timestamps:[],sandbox_ram:[],gpu0_vram:[],gpu0_temp:[],gpu1_vram:[]};
+var metricsHistory={timestamps:[],sandbox_vm_ram:[],gpu0_vram:[],gpu0_temp:[],gpu1_vram:[]};
 var MAX_POINTS=60;
 
 initForm();fetchHealth();fetchTasks();
 // Auto-refresh — skip fetchTasks if user is typing in a reply input
 setInterval(()=>{
   fetchHealth();
-  var activeInput=document.activeElement;
-  var isTyping=activeInput&&(activeInput.tagName==='INPUT'||activeInput.tagName==='TEXTAREA')&&activeInput.id&&(activeInput.id.startsWith('rp-')||activeInput.id==='nf-desc');
-  if(!isTyping)fetchTasks();
+  if(!isUserTyping())fetchTasks();
 },15000);
+
+async function cleanup(){
+  try{var r=await(await fetch('/api/tasks/cleanup',{method:'POST'})).json();alert('Cleanup: '+r.killed+' stuck killed, '+r.cleared+' expired, '+r.queueFlushed+' queue flushed');fetchTasks();}catch{}
+}
+
+function isUserTyping(){
+  var a=document.activeElement;
+  return a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA');
+}
 </script>
 </body>
 </html>

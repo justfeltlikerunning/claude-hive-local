@@ -3,38 +3,44 @@ set -euo pipefail
 SYNAPSE="http://localhost:3000"
 DATE=$(date +%Y-%m-%d)
 TIME=$(date +%H:%M:%S)
-SANDBOX="$HOME/sandbox"
+SANDBOX="/home/sandbox_vm/sandbox"
 MINUTE=$(date +%M)
 
 # Check synapse health
 STATUS=$(curl -sf -m 5 "$SYNAPSE/health" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','down'))" 2>/dev/null || echo "down")
 if [ "$STATUS" != "ok" ]; then exit 0; fi
 
-# Task stats
-TASK_FILE="$SANDBOX/shared/TASKS.json"
-COMPLETED=$(python3 -c "import json;t=json.load(open('$TASK_FILE'));print(len([x for x in t if x.get('status')=='completed' and x.get('created','').startswith('$DATE')]))" 2>/dev/null || echo 0)
-FAILED=$(python3 -c "import json;t=json.load(open('$TASK_FILE'));print(len([x for x in t if x.get('status')=='failed' and x.get('created','').startswith('$DATE')]))" 2>/dev/null || echo 0)
+# Run cleanup first — kill stale tasks
+curl -sf -m 10 "$SYNAPSE/api/tasks/cleanup" -X POST > /dev/null 2>&1
 
-# Rotate duties each heartbeat:
-# :00 and :30 — Coordinator fleet review + autonomous work
-# :15 — Medic health check
-# :45 — Stress tester run
+# Check queue depth — don't create new work if queue is backed up
+STATS=$(curl -sf -m 5 "$SYNAPSE/api/tasks/stats" 2>/dev/null || echo '{}')
+PENDING=$(echo "$STATS" | python3 -c "import sys,json;print(json.load(sys.stdin).get('pending',0))" 2>/dev/null || echo 0)
+IN_PROGRESS=$(echo "$STATS" | python3 -c "import sys,json;print(json.load(sys.stdin).get('in_progress',0))" 2>/dev/null || echo 0)
+COMPLETED=$(echo "$STATS" | python3 -c "import sys,json;print(json.load(sys.stdin).get('completed',0))" 2>/dev/null || echo 0)
+FAILED=$(echo "$STATS" | python3 -c "import sys,json;print(json.load(sys.stdin).get('failed',0))" 2>/dev/null || echo 0)
+
+# Skip if queue is backed up (more than 2 pending or anything in progress)
+if [ "$PENDING" -gt 2 ] 2>/dev/null || [ "$IN_PROGRESS" -gt 0 ] 2>/dev/null; then
+  echo "[$TIME] HEARTBEAT_SKIP — queue busy (pending:$PENDING in_progress:$IN_PROGRESS)"
+  echo "- [$TIME] HEARTBEAT_SKIP (queue busy: $PENDING pending, $IN_PROGRESS active)" >> "$SANDBOX/agents/coordinator/memory/$DATE.md"
+  exit 0
+fi
 
 case "$MINUTE" in
   00|30)
     AGENT="coordinator"
-    PROMPT="AUTONOMOUS HEARTBEAT ($DATE $TIME). Fleet: $COMPLETED completed, $FAILED failed today. Read all agent memories. If idle, create work: have analyst find patterns, builder create tools, researcher summarize docs. If failures exist, diagnose and retry. Keep the fleet productive."
+    PROMPT="AUTONOMOUS HEARTBEAT ($DATE $TIME). Fleet: $COMPLETED completed, $FAILED failed today. Read agent memories. If idle, create ONE task. Keep it simple."
     ;;
   15)
     AGENT="medic"
-    PROMPT="HEALTH CHECK ($DATE $TIME). Fleet: $COMPLETED completed, $FAILED failed. Check all agent memories for errors or stuck tasks. Check ~/sandbox/shared/TASKS.json for failed tasks. If anything is broken, fix it. Write a health report to your reports/health-$DATE.md"
+    PROMPT="HEALTH CHECK ($DATE $TIME). Fleet: $COMPLETED completed, $FAILED failed. Check for stuck tasks and errors. Write brief health report to reports/health-$DATE.md"
     ;;
   45)
     AGENT="stresstester"
-    PROMPT="STRESS TEST ($DATE $TIME). Run a focused test on the sandbox. Pick ONE from: 1) Test what happens when you spawn an agent with an empty prompt 2) Test what happens with a very long prompt (500+ words) 3) Test spawning multiple agents rapidly 4) Test reading a file that doesnt exist. Document results in reports/pinch-points.md with severity ratings and claude-hive impact analysis."
+    PROMPT="STRESS TEST ($DATE $TIME). Run ONE focused test. Document in reports/pinch-points.md with severity and claude-hive impact."
     ;;
   *)
-    # Off-cycle — just log heartbeat OK
     echo "- [$TIME] HEARTBEAT_OK" >> "$SANDBOX/agents/coordinator/memory/$DATE.md"
     exit 0
     ;;
@@ -42,7 +48,7 @@ esac
 
 curl -sf -m 300 "$SYNAPSE/spawn/$AGENT" \
   -H "Content-Type: application/json" \
-  -d "{\"task\": $(echo "$PROMPT" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read().strip()))')}" \
+  -d "{\"source\":\"heartbeat\",\"task\": $(echo "$PROMPT" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read().strip()))')}" \
   > /dev/null 2>&1 || echo "[$TIME] Heartbeat spawn failed"
 
 echo "[$TIME] Heartbeat: $AGENT"

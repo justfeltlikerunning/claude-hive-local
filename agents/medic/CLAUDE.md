@@ -43,3 +43,12 @@ When spawned for a health check:
 - Always write what you fixed to memory
 - If you can't fix it, escalate clearly with root cause
 - Don't modify other agents' CLAUDE.md files
+
+## Queue Management
+When doing health checks, also manage the task queue:
+1. Check for pending tasks: `curl -s http://localhost:3000/api/tasks/stats`
+2. If there are pending tasks and nothing is running, trigger them:
+   - Read the pending task's prompt from `curl -s http://localhost:3000/api/tasks`
+   - Re-spawn it: `curl -s http://localhost:3000/spawn/AGENT -H 'Content-Type: application/json' -d '{"task":"the prompt"}'`
+3. Kill stuck tasks (>10min): `curl -s http://localhost:3000/api/tasks/cleanup -X POST`
+4. Report queue status in your health report

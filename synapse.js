@@ -5,7 +5,7 @@ import { join, basename, extname } from "node:path";
 import { execSync } from "node:child_process";
 
 // ── Config ───────────────────────────────────────────────────────────────────
-const HOME = process.env.HOME || "$HOME";
+const HOME = process.env.HOME || "/home/sandbox";
 const SANDBOX = join(HOME, "sandbox");
 const PORT = parseInt(process.env.PORT || "3000");
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "2");
@@ -219,7 +219,10 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, cors);
-    res.end(JSON.stringify({ status: "ok", runtime: "sandbox-sdk", model: "nemotron-cascade-2-local", agents: Object.keys(AGENTS), activeJobs, queueDepth: jobQueue.length }));
+    // Detect model from gpu_server /props or /v1/models
+    let modelName = "local-model";
+    try { const r = await fetch(process.env.ANTHROPIC_BASE_URL + "/v1/models", { signal: AbortSignal.timeout(2000) }); const d = await r.json(); modelName = (d.models?.[0]?.name || d.data?.[0]?.id || "").replace(".gguf","") || "local-model"; } catch {}
+    res.end(JSON.stringify({ status: "ok", runtime: "sandbox-sdk", model: modelName, agents: Object.keys(AGENTS), activeJobs, queueDepth: jobQueue.length }));
     return;
   }
 
@@ -239,10 +242,10 @@ const server = http.createServer(async (req, res) => {
     let payload;
     try { payload = JSON.parse(body); } catch { res.writeHead(400, cors); res.end(JSON.stringify({ error: "invalid json" })); return; }
 
-    const { task: taskPrompt } = payload;
+    const { task: taskPrompt, source: taskSource } = payload;
     if (!taskPrompt || taskPrompt.trim().length < 3) { res.writeHead(400, cors); res.end(JSON.stringify({ error: "task prompt is required (min 3 chars)" })); return; }
 
-    const task = createTask({ agent: agentName, prompt: taskPrompt, source: "spawn" });
+    const task = createTask({ agent: agentName, prompt: taskPrompt, source: taskSource || "spawn" });
 
     try {
       const result = await new Promise((resolve, reject) => {
@@ -253,7 +256,7 @@ const server = http.createServer(async (req, res) => {
 
       // Detect files created by the agent
       const responseText = result.result || "";
-      const fileRefs = responseText.match(/(?:~\/sandbox|\/home\/sandbox-vm\/sandbox)\/[^\s\n)]+/g) || [];
+      const fileRefs = responseText.match(/(?:~\/sandbox|\/home\/sandbox_vm\/sandbox)\/[^\s\n)]+/g) || [];
       const attachedFiles = [];
       for (const ref of fileRefs) {
         const fpath = ref.replace("~/sandbox", join(HOME, "sandbox"));
@@ -512,7 +515,7 @@ const server = http.createServer(async (req, res) => {
             }
 
             // Detect files created/mentioned and attach content
-            const fileRefs = responseText.match(/(?:~\/sandbox|\/home\/sandbox-vm\/sandbox)\/[^\s\n)]+/g) || [];
+            const fileRefs = responseText.match(/(?:~\/sandbox|\/home\/sandbox_vm\/sandbox)\/[^\s\n)]+/g) || [];
             const attachedFiles = [];
             for (const ref of fileRefs) {
               const fpath = ref.replace("~/sandbox", join(HOME, "sandbox"));
@@ -569,6 +572,60 @@ const server = http.createServer(async (req, res) => {
         } catch (e) { logSandbox(`[${task.id}] Conversation start failed: ${e.message}`); }
       })();
     }
+    return;
+  }
+
+  // ── Task cleanup — kill stale tasks, clear queue ──
+  if (req.method === "POST" && req.url === "/api/tasks/cleanup") {
+    const tasks = loadTasks();
+    const now = Date.now();
+    let killed = 0;
+    let cleared = 0;
+    for (const t of tasks) {
+      // Kill tasks stuck in_progress for more than 10 min
+      if (t.status === "in_progress" && t.created) {
+        const age = now - new Date(t.created).getTime();
+        if (age > 600000) {
+          t.status = "failed";
+          t.error = "Killed by cleanup (stuck >10min)";
+          killed++;
+        }
+      }
+      // Kill pending tasks older than 30 min (stale queue)
+      if (t.status === "pending" && t.created) {
+        const age = now - new Date(t.created).getTime();
+        if (age > 1800000) {
+          t.status = "failed";
+          t.error = "Expired from queue (>30min pending)";
+          cleared++;
+        }
+      }
+    }
+    saveTasks(tasks);
+    // Clear in-memory job queue too
+    const queueCleared = jobQueue.length;
+    jobQueue.length = 0;
+    logSandbox(`Cleanup: ${killed} stuck killed, ${cleared} expired cleared, ${queueCleared} queue flushed`);
+    res.writeHead(200, cors);
+    res.end(JSON.stringify({ killed, cleared, queueFlushed: queueCleared }));
+    return;
+  }
+
+  // ── Task stats ──
+  if (req.method === "GET" && req.url === "/api/tasks/stats") {
+    const tasks = loadTasks();
+    const { date } = localDateTime();
+    const today = tasks.filter(t => (t.created || "").startsWith(date));
+    res.writeHead(200, cors);
+    res.end(JSON.stringify({
+      total: tasks.length,
+      today: today.length,
+      pending: tasks.filter(t => t.status === "pending").length,
+      in_progress: tasks.filter(t => t.status === "in_progress").length,
+      completed: today.filter(t => t.status === "completed").length,
+      failed: today.filter(t => t.status === "failed").length,
+      queueDepth: jobQueue.length,
+    }));
     return;
   }
 
@@ -739,9 +796,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Metrics — sandbox-vm + gpu-server
+  // Metrics — sandbox_vm + gpu_server
   if (req.method === "GET" && req.url === "/api/metrics") {
-    const metrics = { sandbox-vm: {}, gpu-server: {} };
+    const metrics = { sandbox_vm: {}, gpu_server: {} };
     try {
       // Greenbow CPU/RAM from node_exporter
       const gRes = await fetch("http://localhost:9100/metrics", { signal: AbortSignal.timeout(3000) });
@@ -749,8 +806,8 @@ const server = http.createServer(async (req, res) => {
       const memTotal = gText.match(/^node_memory_MemTotal_bytes\s+([\d.e+]+)/m);
       const memAvail = gText.match(/^node_memory_MemAvailable_bytes\s+([\d.e+]+)/m);
       if (memTotal && memAvail) {
-        metrics.sandbox-vm.ramTotalGB = (parseFloat(memTotal[1]) / 1073741824).toFixed(1);
-        metrics.sandbox-vm.ramUsedGB = ((parseFloat(memTotal[1]) - parseFloat(memAvail[1])) / 1073741824).toFixed(1);
+        metrics.sandbox_vm.ramTotalGB = (parseFloat(memTotal[1]) / 1073741824).toFixed(1);
+        metrics.sandbox_vm.ramUsedGB = ((parseFloat(memTotal[1]) - parseFloat(memAvail[1])) / 1073741824).toFixed(1);
       }
     } catch {}
     try {
@@ -760,15 +817,15 @@ const server = http.createServer(async (req, res) => {
       const memTotal = bText.match(/^node_memory_MemTotal_bytes\s+([\d.e+]+)/m);
       const memAvail = bText.match(/^node_memory_MemAvailable_bytes\s+([\d.e+]+)/m);
       if (memTotal && memAvail) {
-        metrics.gpu-server.ramTotalGB = (parseFloat(memTotal[1]) / 1073741824).toFixed(1);
-        metrics.gpu-server.ramUsedGB = ((parseFloat(memTotal[1]) - parseFloat(memAvail[1])) / 1073741824).toFixed(1);
+        metrics.gpu_server.ramTotalGB = (parseFloat(memTotal[1]) / 1073741824).toFixed(1);
+        metrics.gpu_server.ramUsedGB = ((parseFloat(memTotal[1]) - parseFloat(memAvail[1])) / 1073741824).toFixed(1);
       }
     } catch {}
     try {
       // Barracuda GPU via HTTP metrics API
       const gpuRes = await fetch("http://GPU_HOST:9105/", { signal: AbortSignal.timeout(3000) });
       const gpuData = await gpuRes.json();
-      metrics.gpu-server.gpus = gpuData.gpus || [];
+      metrics.gpu_server.gpus = gpuData.gpus || [];
     } catch {}
     res.writeHead(200, cors);
     res.end(JSON.stringify(metrics));
@@ -797,6 +854,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Metrics history (persisted)
+  if (req.method === "GET" && req.url === "/api/metrics-history") {
+    const histFile = join(SANDBOX, "logs", "metrics-history.json");
+    if (existsSync(histFile)) {
+      res.writeHead(200, cors);
+      res.end(readFileSync(histFile));
+    } else {
+      res.writeHead(200, cors);
+      res.end(JSON.stringify({ timestamps: [], sandbox_vm_ram: [], gpu0_vram: [], gpu0_temp: [], gpu1_vram: [] }));
+    }
+    return;
+  }
+
   // Synapse logs
   if (req.method === "GET" && req.url === "/api/logs") {
     const { date } = localDateTime();
@@ -811,8 +881,103 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "not found" }));
 });
 
+// ── Auto-drain: process pending tasks when queue is idle ──
+setInterval(() => {
+  if (activeJobs >= MAX_CONCURRENT) return; // busy
+  if (jobQueue.length > 0) return; // queue has items being processed
+
+  const tasks = loadTasks();
+  const pending = tasks.filter(t => t.status === "pending").sort((a, b) => (a.created || "").localeCompare(b.created || ""));
+  if (!pending.length) return;
+
+  const task = pending[0];
+  logSandbox(`[auto-drain] Processing pending task ${task.id} for ${task.agent}`);
+  updateTask(task.id, { status: "in_progress" });
+
+  const job = {
+    agent: task.agent,
+    prompt: task.prompt,
+    resolve: (result) => {
+      const responseText = result.result || "";
+      // Detect files
+      const fileRefs = responseText.match(/(?:~\/sandbox|\/home\/sandbox_vm\/sandbox)\/[^\s\n)]+/g) || [];
+      const attachedFiles = [];
+      for (const ref of fileRefs) {
+        const fpath = ref.replace("~/sandbox", join(HOME, "sandbox"));
+        if (existsSync(fpath) && require("fs").statSync(fpath).isFile()) {
+          if (/\.(md|txt|py|json|csv|html|js|sh|log)$/i.test(fpath)) {
+            attachedFiles.push({ name: fpath.split("/").pop(), path: ref, content: readFileSync(fpath, "utf-8").substring(0, 20000) });
+          } else {
+            attachedFiles.push({ name: fpath.split("/").pop(), path: ref, size: require("fs").statSync(fpath).size });
+          }
+        }
+      }
+      const taskData = loadTasks().find(t => t.id === task.id);
+      if (taskData) {
+        if (!taskData.messages) taskData.messages = [{ role: "user", content: task.prompt, ts: task.created }];
+        taskData.messages.push({ role: "agent", agent: task.agent, content: responseText, ts: localDateTime().iso, files: attachedFiles.length ? attachedFiles : undefined });
+        updateTask(task.id, { status: "completed", completed: localDateTime().iso, result: responseText.substring(0, 2000), messages: taskData.messages });
+      } else {
+        updateTask(task.id, { status: "completed", completed: localDateTime().iso, result: responseText.substring(0, 2000) });
+      }
+      logSandbox(`[auto-drain] Task ${task.id} completed`);
+    },
+    reject: (err) => {
+      updateTask(task.id, { status: "failed", error: err.message?.substring(0, 500) });
+      logSandbox(`[auto-drain] Task ${task.id} failed: ${err.message}`);
+    }
+  };
+
+  processJob(job);
+}, 10000); // Check every 10 seconds
+
+// ── Persistent metrics collector ──
+const METRICS_HIST_FILE = join(SANDBOX, "logs", "metrics-history.json");
+const METRICS_MAX = 720; // 1 hour at 5s intervals
+let metricsHist;
+try { metricsHist = JSON.parse(readFileSync(METRICS_HIST_FILE, "utf-8")); } catch { metricsHist = { timestamps: [], sandbox_vm_ram: [], gpu0_vram: [], gpu0_temp: [], gpu1_vram: [] }; }
+
+setInterval(async () => {
+  try {
+    const gRes = await fetch("http://localhost:9100/metrics", { signal: AbortSignal.timeout(3000) });
+    const gText = await gRes.text();
+    const memTotal = gText.match(/^node_memory_MemTotal_bytes\s+([\d.e+]+)/m);
+    const memAvail = gText.match(/^node_memory_MemAvailable_bytes\s+([\d.e+]+)/m);
+    const ramUsed = memTotal && memAvail ? (parseFloat(memTotal[1]) - parseFloat(memAvail[1])) / 1073741824 : 0;
+    metricsHist.sandbox_vm_ram.push(parseFloat(ramUsed.toFixed(1)));
+    metricsHist.timestamps.push(Date.now());
+  } catch { metricsHist.sandbox_vm_ram.push(0); metricsHist.timestamps.push(Date.now()); }
+  try {
+    const gpuRes = await fetch(`http://${process.env.ANTHROPIC_BASE_URL?.match(/\/\/([\d.]+)/)?.[1] || "GPU_HOST"}:9105/`, { signal: AbortSignal.timeout(3000) });
+    const gpuData = await gpuRes.json();
+    metricsHist.gpu0_vram.push(parseInt(gpuData.gpus?.[0]?.memUsed) || 0);
+    metricsHist.gpu0_temp.push(parseInt(gpuData.gpus?.[0]?.temp) || 0);
+    metricsHist.gpu1_vram.push(parseInt(gpuData.gpus?.[1]?.memUsed) || 0);
+  } catch { metricsHist.gpu0_vram.push(0); metricsHist.gpu0_temp.push(0); metricsHist.gpu1_vram.push(0); }
+  // Trim
+  while (metricsHist.timestamps.length > METRICS_MAX) {
+    metricsHist.timestamps.shift(); metricsHist.sandbox_vm_ram.shift();
+    metricsHist.gpu0_vram.shift(); metricsHist.gpu0_temp.shift(); metricsHist.gpu1_vram.shift();
+  }
+  // Persist
+  try { writeFileSync(METRICS_HIST_FILE, JSON.stringify(metricsHist)); } catch {}
+}, 5000);
+
 server.listen(PORT, "0.0.0.0", () => {
   logSandbox(`Sandbox Synapse v2 (SDK) listening on :${PORT}`);
   logSandbox(`Model: ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL || "not set"}`);
   logSandbox(`Agents: ${Object.keys(AGENTS).join(", ")}`);
+
+  // Recover pending/in_progress tasks from before restart
+  const tasks = loadTasks();
+  const stuck = tasks.filter(t => t.status === "in_progress");
+  const pending = tasks.filter(t => t.status === "pending");
+  for (const t of stuck) {
+    updateTask(t.id, { status: "failed", error: "Interrupted by restart" });
+    logSandbox(`[${t.agent}] Task ${t.id} marked failed (interrupted by restart)`);
+  }
+  if (pending.length) {
+    logSandbox(`Found ${pending.length} pending tasks — re-queuing`);
+  }
+  // Show pending tasks in dashboard (they stay as "pending" for manual run)
 });

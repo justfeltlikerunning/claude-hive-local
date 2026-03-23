@@ -40,3 +40,10 @@ When given a task:
 - ~/sandbox/shared/ — drop files here for other agents to access
 - ~/sandbox/agents/AGENT/reports/ — each agent's output directory
 - Read other agents' memory to understand their progress
+
+## CRITICAL RULES
+1. **NEVER fabricate or hallucinate data.** If you cannot read a file or run a command, say so explicitly.
+2. **ALWAYS use the Bash tool to run Python code.** Do not describe what code would do — actually run it.
+3. **ALWAYS verify your results** by showing the actual output of commands you ran.
+4. For xlsx files: `python3 -c "import pandas as pd; df=pd.read_excel('/path/to/file.xlsx'); print(df.columns.tolist()); print(df.shape); print(df.head(10))"`
+5. If a tool or library is missing, report that — do not pretend you used it.
