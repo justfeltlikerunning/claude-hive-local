@@ -1,0 +1,1 @@
+{"name":"claude-hive-local","version":"1.0.0","type":"module","description":"Local agent sandbox — battle-test agent orchestration with local LLM inference","dependencies":{"@anthropic-ai/claude-agent-sdk":"*"}}
